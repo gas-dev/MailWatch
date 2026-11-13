@@ -603,7 +603,7 @@ input,select{transition:border-color .15s,box-shadow .15s}
 <form method="post" action="/test-imap" target="mailwatch_test_popup" onsubmit="window.open('','mailwatch_test_popup','width=720,height=560,resizable=yes,scrollbars=yes')"><input type="hidden" name="csrf" value="{{csrf}}"><button class="btn-soft" name="id" value="{{a.id}}">Test</button></form>
 <form method="post" action="/remove" onsubmit="return confirm('Remove this mailbox and its configuration?')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="type" value="account"><button class="btn-danger" name="id" value="{{a.id}}">Remove</button></form>
 </div></td></tr>
-<tr class="edit-row"><td colspan="4"><details id="mailbox-edit-{{a.id}}" class="edit-panel"><summary>✎ Edit mailbox settings · {{a.address}}</summary>
+<tr class="edit-row"><td colspan="5"><details id="mailbox-edit-{{a.id}}" class="edit-panel"><summary>✎ Edit mailbox settings · {{a.address}}</summary>
 <form method="post" action="/account/edit" autocomplete="off"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="id" value="{{a.id}}">
 <div class="grid">
 <div><label>Email address</label><input type="email" name="address" value="{{a.address}}" required></div>
@@ -614,7 +614,7 @@ input,select{transition:border-color .15s,box-shadow .15s}
 </div><p class="help">Updating an account preserves its record, message history and alert tracking. A blank password does not change the stored secret.</p>
 <button type="submit">Save mailbox changes</button>
 </form></details></td></tr>
-{% else %}<tr><td colspan="4">No mailboxes configured yet.</td></tr>{% endfor %}
+{% else %}<tr><td colspan="5">No mailboxes configured yet.</td></tr>{% endfor %}
 </tbody></table></div>
 <h3>Add IMAP account</h3><form method="post" action="/account"><input type="hidden" name="csrf" value="{{csrf}}"><div class="grid">
 <div><label>Email address</label><input type="email" name="address" required></div><div><label>IMAP server</label><input name="host" placeholder="imaps.pec.aruba.it" required></div>
@@ -705,7 +705,7 @@ def edit_account():
             if not current:abort(404)
             if password:
                 c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,password=?,
-                             last_error=NULL,last_error_at=NULL WHERE id=?""",
+                             last_error=NULL,last_error_at=NULL,last_ok=NULL,last_attempt=NULL WHERE id=?""",
                           (address,host,port,login,crypt.encrypt(password.encode()).decode(),account_id))
             else:
                 c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,
