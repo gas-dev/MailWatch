@@ -49,6 +49,11 @@ def init():
           account_id INTEGER PRIMARY KEY,uidvalidity TEXT NOT NULL,
           first_uid INTEGER NOT NULL,created TEXT NOT NULL);
         """)
+        account_columns=[col[1] for col in c.execute("PRAGMA table_info(accounts)")]
+        if "last_attempt" not in account_columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN last_attempt TEXT")
+        if "last_error_at" not in account_columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN last_error_at TEXT")
         if "preview" not in [col[1] for col in c.execute("PRAGMA table_info(messages)")]:
             c.execute("ALTER TABLE messages ADD COLUMN preview TEXT DEFAULT ''")
         if "sender_name" not in [col[1] for col in c.execute("PRAGMA table_info(messages)")]:
@@ -95,6 +100,14 @@ def sender_identity(msg):
     return display.strip(),address.lower().strip()
 def utc_str(dt):return dt.astimezone(timezone.utc).isoformat()
 def local_now():return datetime.now(TZ)
+def display_time(value):
+    if not value:return "Never"
+    try:
+        dt=datetime.fromisoformat(value)
+        if dt.tzinfo is None:dt=dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TZ).strftime("%d/%m/%Y %H:%M:%S")
+    except (TypeError,ValueError):
+        return "Unavailable"
 def all_accounts():
     with db() as c:return c.execute("SELECT * FROM accounts ORDER BY address").fetchall()
 class _PreviewHTML(HTMLParser):
@@ -170,8 +183,14 @@ def scan():
     rows=all_accounts()
     block=[]
     with db() as c:block=[x["pattern"].lower() for x in c.execute("SELECT pattern FROM blocked")]
+    checked=0
+    failures=[]
     for a in rows:
         if not a["enabled"]:continue
+        checked+=1
+        with db() as c:
+            c.execute("UPDATE accounts SET last_attempt=? WHERE id=?",
+                      (utc_str(datetime.now(timezone.utc)),a["id"]))
         conn=None
         try:
             conn=imaplib.IMAP4_SSL(a["host"],a["port"],timeout=25)
@@ -255,14 +274,25 @@ def scan():
                 isblocked=any(fnmatch.fnmatchcase(sender,p if not p.startswith("@") else "*"+p) for p in block)
                 preview="" if isblocked else preview_text(conn,uidb)
                 with db() as c:c.execute("INSERT OR IGNORE INTO messages(account_id,uidvalidity,uid,received,sender,subject,blocked,preview,sender_name,alerted) VALUES (?,?,?,?,?,?,?,?,?,?)",(a["id"],validity,uid,utc_str(dt),sender,subject,int(isblocked),preview,sender_name,int(uid<baseline_uid)))
-            with db() as c:c.execute("UPDATE accounts SET last_ok=?,last_error=NULL WHERE id=?",(utc_str(datetime.now(timezone.utc)),a["id"]))
+            with db() as c:
+                c.execute("""UPDATE accounts SET last_ok=?,last_attempt=?,
+                             last_error=NULL,last_error_at=NULL WHERE id=?""",
+                          (utc_str(datetime.now(timezone.utc)),
+                           utc_str(datetime.now(timezone.utc)),a["id"]))
         except Exception as exc:
             logging.exception("IMAP failure for account %s",a["address"])
-            with db() as c:c.execute("UPDATE accounts SET last_error=? WHERE id=?",(str(exc)[:300],a["id"]))
+            failure_message=(type(exc).__name__+": "+str(exc)).strip()[:300]
+            failures.append({"address":a["address"],"reason":failure_message})
+            with db() as c:
+                c.execute("""UPDATE accounts SET last_error=?,last_error_at=? WHERE id=?""",
+                          (failure_message,utc_str(datetime.now(timezone.utc)),a["id"]))
         finally:
             if conn:
                 try:conn.logout()
                 except Exception:pass
+    return {"checked":checked,"successful":checked-len(failures),
+            "failed":len(failures),"failures":failures}
+
 def recipients(o):
     with db() as c:
         return [r["address"] for r in c.execute(
@@ -418,8 +448,14 @@ def run_due():
         with db() as c:
             if c.execute("SELECT 1 FROM jobs WHERE k=?",(key,)).fetchone():return
             c.execute("INSERT INTO jobs VALUES (?,?,?,?)",(key,utc_str(datetime.now(timezone.utc)),"running",""))
-        scan()
-        with db() as c:c.execute("UPDATE jobs SET status='done' WHERE k=?",(key,))
+        result=scan()
+        scan_status="partial" if result["failed"] else "done"
+        details="%d/%d mailboxes checked successfully"%(result["successful"],result["checked"])
+        if result["failed"]:
+            details+=" | "+", ".join(x["address"]+": "+x["reason"][:95] for x in result["failures"])
+        with db() as c:
+            c.execute("UPDATE jobs SET status=?,details=? WHERE k=?",
+                      (scan_status,details[:750],key))
         if hm==daily and mode in ("both","daily"):
             notify("daily",(now.date()-timedelta(days=1)).isoformat())
         if hm in alerts and mode in ("both","alerts"):
@@ -463,6 +499,12 @@ td,th{padding:13px 10px;border-bottom:1px solid #eef1f6;text-align:left;vertical
 tr:last-child td{border-bottom:0}.table-scroll{overflow-x:auto}
 .badge{display:inline-block;padding:3px 9px;border-radius:50px;background:#e5f6ed;color:#127a4f;font-size:11px;font-weight:700}
 .badge.off{background:#fff0e9;color:#a75c1f}
+.mailbox-error{background:#fff7f4;border:1px solid #f7dcd0;color:#8a3c2b;border-radius:9px;padding:10px 12px;margin-top:8px;font-size:12px;max-width:440px;line-height:1.5;overflow-wrap:anywhere}
+.mailbox-error strong{display:block;color:#933c2e;margin-bottom:3px}
+.mailbox-timestamp{font-size:12px;color:#64748b;white-space:nowrap}
+.mailbox-timestamp span{display:block}
+.status-note{color:#7a889a;font-size:12px;margin-top:5px}
+.badge.unknown{background:#edf1f7;color:#687a8e}
 .notice{background:#e7f6ee;color:#176b49;padding:13px 16px;border:1px solid #b8e6ce;border-radius:10px;margin:15px 0}
 .error{color:#b34b51}.pill{padding:5px 11px;border-radius:8px;background:#edf4ff;color:#2b5998;font-weight:650}
 .toolbar{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
@@ -540,12 +582,25 @@ input,select{transition:border-color .15s,box-shadow .15s}
 <div><label>Display name (optional)</label><input name="label" maxlength="100" placeholder="Legal team / manager"></div>
 </div><button>Add receiver</button></form></section>
 <section id="mailboxes"><div class="section-head"><div><h2><span class="heading-icon">✉</span> IMAP mailboxes</h2><p class="muted">Secure read-only connection for regular email and certified PEC accounts.</p></div><span class="pill">SSL / TLS</span></div>
-<div class="table-scroll"><table><thead><tr><th>Mailbox</th><th>Last successful check</th><th>Connection</th><th>Manage</th></tr></thead><tbody>
+<div class="table-scroll"><table><thead><tr><th>Mailbox</th><th>Last successful check</th><th>Last attempt</th><th>Connection status and diagnostics</th><th>Manage</th></tr></thead><tbody>
 {% for a in accounts %}
-<tr><td><div class="mailbox-cell"><span class="mailbox-icon">✉</span><span>{{a.address}}</span></div></td><td>{{a.last_ok or 'Never'}}</td><td><span class="badge {% if a.last_error %}off{% endif %}">{{'Attention' if a.last_error else 'Ready'}}</span></td>
+<tr>
+<td><div class="mailbox-cell"><span class="mailbox-icon">✉</span><span>{{a.address}}</span></div></td>
+<td><span class="mailbox-timestamp">{{timefmt(a.last_ok)}}</span></td>
+<td><span class="mailbox-timestamp">{{timefmt(a.last_attempt) if a.last_attempt else 'Not recorded yet'}}</span></td>
+<td>
+{% if a.last_error %}
+<span class="badge off">Attention</span>
+<div class="mailbox-error"><strong>Last IMAP error</strong>{{a.last_error}}
+<div class="status-note">Error recorded: {{timefmt(a.last_error_at) if a.last_error_at else 'Before diagnostics upgrade'}}</div></div>
+{% elif a.last_ok %}
+<span class="badge">Ready</span><div class="status-note">Last check completed successfully</div>
+{% else %}
+<span class="badge unknown">Not checked</span><div class="status-note">No successful connection recorded yet</div>
+{% endif %}
+</td>
 <td><div class="action-row">
 <form method="post" action="/test-imap" target="mailwatch_test_popup" onsubmit="window.open('','mailwatch_test_popup','width=720,height=560,resizable=yes,scrollbars=yes')"><input type="hidden" name="csrf" value="{{csrf}}"><button class="btn-soft" name="id" value="{{a.id}}">Test</button></form>
-
 <form method="post" action="/remove" onsubmit="return confirm('Remove this mailbox and its configuration?')"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="type" value="account"><button class="btn-danger" name="id" value="{{a.id}}">Remove</button></form>
 </div></td></tr>
 <tr class="edit-row"><td colspan="4"><details id="mailbox-edit-{{a.id}}" class="edit-panel"><summary>✎ Edit mailbox settings · {{a.address}}</summary>
@@ -605,7 +660,7 @@ def home():
                    "indexed":c.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
                    "recipients":c.execute("SELECT COUNT(*) FROM notification_recipients WHERE enabled=1").fetchone()[0]}
         o=opts()
-        return render_template_string(PAGE,authed=True,csrf=token(),accounts=all_accounts(),blocked=blocks,jobs=jobs,options=o,recipients_list=recipients_list,stats=stats,alert_schedule=o.get("alert_times","").split(","))
+        return render_template_string(PAGE,authed=True,csrf=token(),accounts=all_accounts(),blocked=blocks,jobs=jobs,options=o,recipients_list=recipients_list,stats=stats,timefmt=display_time,alert_schedule=o.get("alert_times","").split(","))
     return render_template_string(PAGE,authed=False,csrf=token())
 @app.post("/login")
 def login():
@@ -650,7 +705,7 @@ def edit_account():
             if not current:abort(404)
             if password:
                 c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,password=?,
-                             last_error=NULL,last_ok=NULL WHERE id=?""",
+                             last_error=NULL,last_error_at=NULL WHERE id=?""",
                           (address,host,port,login,crypt.encrypt(password.encode()).decode(),account_id))
             else:
                 c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,
