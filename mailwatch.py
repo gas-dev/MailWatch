@@ -256,8 +256,6 @@ def scan():
                 if typ!="OK":continue
                 parts=[item for item in data if isinstance(item,tuple)]
                 if not parts:continue
-                from email.parser import BytesParser
-                from email import policy
                 msg=BytesParser(policy=policy.default).parsebytes(parts[0][1])
                 meta=parts[0][0]
                 from imaplib import Internaldate2tuple
