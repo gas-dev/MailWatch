@@ -11,6 +11,7 @@ from html.parser import HTMLParser
 from collections import Counter
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from urllib.parse import urlsplit
 from flask import Flask, request, redirect, session, render_template_string, flash, abort
 from markupsafe import escape
 import google_mail
@@ -54,6 +55,8 @@ def init():
             c.execute("ALTER TABLE accounts ADD COLUMN last_attempt TEXT")
         if "last_error_at" not in account_columns:
             c.execute("ALTER TABLE accounts ADD COLUMN last_error_at TEXT")
+        if "webmail_url" not in account_columns:
+            c.execute("ALTER TABLE accounts ADD COLUMN webmail_url TEXT NOT NULL DEFAULT ''")
         if "preview" not in [col[1] for col in c.execute("PRAGMA table_info(messages)")]:
             c.execute("ALTER TABLE messages ADD COLUMN preview TEXT DEFAULT ''")
         if "sender_name" not in [col[1] for col in c.execute("PRAGMA table_info(messages)")]:
@@ -296,6 +299,23 @@ def recipients(o):
         return [r["address"] for r in c.execute(
             "SELECT address FROM notification_recipients WHERE enabled=1 ORDER BY address")]
 
+def validate_webmail_url(value):
+    """A per-mailbox link to its webmail home, not a generated message deep link."""
+    value=value.strip()
+    if not value:
+        return ""
+    parsed=urlsplit(value)
+    if (parsed.scheme.lower() not in ("https","http") or not parsed.hostname
+            or parsed.username or parsed.password or any(ch.isspace() for ch in value)
+            or any(ord(ch)<32 for ch in value)):
+        raise ValueError("Webmail URL must be an absolute http:// or https:// address")
+    return value
+
+def webmail_links():
+    with db() as c:
+        return {a["address"]:a["webmail_url"] for a in c.execute(
+            "SELECT address,webmail_url FROM accounts WHERE webmail_url != ''")}
+
 def report_counts(items, mailbox_names=None):
     counts=Counter(item["address"] for item in items)
     return [(address,counts.get(address,0)) for address in sorted(set(mailbox_names or [])|set(counts))]
@@ -315,6 +335,7 @@ def report_text(title,items,mailboxes=None,note="",part=None,summary_items=None)
 def report_html(title,items,mailboxes=None,note="",part=None,summary_items=None):
     from html import escape as esc
     summary=report_counts(items if summary_items is None else summary_items,mailboxes)
+    links=webmail_links()
     count=sum(n for _,n in summary)
     header='''<!doctype html><html><head><meta charset="utf-8"></head>
     <body style="margin:0;padding:28px 12px;background:#f2f6fb;color:#26374a;font:14px Arial,Helvetica,sans-serif">
@@ -344,6 +365,9 @@ def report_html(title,items,mailboxes=None,note="",part=None,summary_items=None)
           <div style="padding-top:7px;font-size:13px"><strong>From:</strong> '''+esc(from_text)+'''</div>
           <div style="padding-top:5px;font-size:13px"><strong>Subject:</strong> '''+esc(m["subject"])+'''</div>
           <div style="padding-top:9px;color:#52677e;font-size:13px;white-space:pre-line">'''+esc(m["preview"] or "[Preview not available]")+'''</div></div>'''
+        if links.get(m["address"]):
+            # Place a link after this message, never inside untrusted preview HTML.
+            header+='<p style="margin:-4px 0 18px 8px"><a style="color:#174e90;font-weight:bold" href="'+esc(links[m["address"]],quote=True)+'">Open mailbox in webmail</a></p>'
     return header+'''</div><div style="padding:17px 28px;background:#f8fafd;border-top:1px solid #e4ebf3;color:#8492a6;font-size:11px">
     MailWatch · Created by Techitapp. Original mailbox messages and read/unread states were not changed.</div></div></body></html>'''
 
@@ -382,6 +406,7 @@ def lines(items):
     ordered=sorted(items,key=lambda m:m["received"],reverse=True)
     ordered.sort(key=lambda m:m["address"].lower())
     out=[]
+    links=webmail_links()
     last=None
     for m in ordered:
         if m["address"]!=last:
@@ -393,11 +418,14 @@ def lines(items):
         preview=m["preview"] if "preview" in m.keys() else ""
         out.extend(["Received: "+at,"From: "+(name+" <"+sender+">" if name else sender),
                     "Subject: "+m["subject"],"Preview:",
-                    preview or "[Preview not yet collected]","-"*60])
+                    preview or "[Preview not yet collected]"])
+        if links.get(m["address"]):
+            out.append("Open mailbox in webmail: "+links[m["address"]])
+        out.append("-"*60)
     return "\n".join(out)
 
 def notify(kind,day):
-    """Send only previously unreported messages. Empty reports are never emailed."""
+    """Send unreported messages; daily digest also serves as an empty-day heartbeat."""
     with lock:
         ident=kind+":"+day
         with db() as c:
@@ -407,13 +435,15 @@ def notify(kind,day):
             items=c.execute("""SELECT m.*,a.address FROM messages m JOIN accounts a
               ON a.id=m.account_id WHERE m.alerted=0 AND m.blocked=0 AND a.enabled=1
               ORDER BY a.address,m.received DESC""").fetchall()
-        if not items:
+        if not items and kind!="daily":
             logging.info("MailWatch: no new mail, no %s email sent",kind)
             return "no new mail"
         title=("Daily digest: new mail pending" if kind=="daily" else "New mail alert")
         title_date=(day+" · " if kind=="daily" else "")
-        summary=report_text(title,items,[a["address"] for a in all_accounts() if a["enabled"]])
-        formatted=report_html(title,items,[a["address"] for a in all_accounts() if a["enabled"]])
+        mailboxes=[a["address"] for a in all_accounts() if a["enabled"]]
+        note="No new emails to report. MailWatch daily heartbeat." if kind=="daily" and not items else ""
+        summary=report_text(title,items,mailboxes,note=note)
+        formatted=report_html(title,items,mailboxes,note=note)
         with db() as c:
             c.execute("""INSERT INTO jobs(k,created,status,details) VALUES (?,?,?,?)
                          ON CONFLICT(k) DO UPDATE SET status=excluded.status,details=excluded.details""",
@@ -552,7 +582,7 @@ input,select{transition:border-color .15s,box-shadow .15s}
 <section id="schedule"><div class="section-head"><div><h2>Notification schedule</h2><p class="muted">Choose when reports are delivered and which reports to send.</p></div><span class="pill">Automatic</span></div>
 <form method="post" action="/schedule"><input type="hidden" name="csrf" value="{{csrf}}">
 <div class="grid">
-<div><label for="daily-time">Daily digest time</label><input id="daily-time" name="daily_time" type="time" value="{{options.daily_time}}" required><p class="help">Sends only newly detected, unreported messages. No mail means no digest.</p></div>
+<div><label for="daily-time">Daily digest time</label><input id="daily-time" name="daily_time" type="time" value="{{options.daily_time}}" required><p class="help">Sends pending messages, or a zero-email heartbeat if there are none. No mail means no digest.</p></div>
 <div><label for="send-mode">Delivery mode</label><select id="send-mode" name="delivery_mode">
 <option value="both" {% if options.delivery_mode=='both' %}selected{% endif %}>Daily digest + new-mail alerts</option>
 <option value="daily" {% if options.delivery_mode=='daily' %}selected{% endif %}>Daily digest only</option>
@@ -609,6 +639,7 @@ input,select{transition:border-color .15s,box-shadow .15s}
 <div><label>TLS port</label><input name="port" inputmode="numeric" value="{{a.port}}" required></div>
 <div><label>Username</label><input name="login" value="{{a.login}}" required></div>
 <div><label>New IMAP password (optional)</label><input type="password" name="password" autocomplete="new-password" placeholder="Leave blank to keep saved password"></div>
+<div><label>Webmail URL (optional)</label><input type="url" name="webmail_url" value="{{a.webmail_url}}" placeholder="https://webmail.example.com/" autocomplete="url"></div>
 </div><p class="help">Updating an account preserves its record, message history and alert tracking. A blank password does not change the stored secret.</p>
 <button type="submit">Save mailbox changes</button>
 </form></details></td></tr>
@@ -617,7 +648,8 @@ input,select{transition:border-color .15s,box-shadow .15s}
 <h3>Add IMAP account</h3><form method="post" action="/account"><input type="hidden" name="csrf" value="{{csrf}}"><div class="grid">
 <div><label>Email address</label><input type="email" name="address" required></div><div><label>IMAP server</label><input name="host" placeholder="imaps.pec.aruba.it" required></div>
 <div><label>TLS port</label><input name="port" value="993" required></div><div><label>Username</label><input name="login" required></div>
-<div><label>Password IMAP/app password</label><input type="password" name="password" required></div></div><button>Save account</button></form></section>
+<div><label>Password IMAP/app password</label><input type="password" name="password" required></div>
+<div><label>Webmail URL (optional)</label><input type="url" name="webmail_url" placeholder="https://webmail.example.com/" autocomplete="url"></div></div><button>Save account</button></form></section>
 <section id="blacklist"><div class="section-head"><div><h2>Sender blacklist</h2><p class="muted">Messages matching these rules are excluded from delivery.</p></div></div><table>{% for b in blocked %}<tr><td>{{b.pattern}}</td><td><form method="post" action="/remove"><input type="hidden" name="csrf" value="{{csrf}}"><input type="hidden" name="type" value="block"><button name="id" value="{{b.id}}">Remove</button></form></td></tr>{% endfor %}</table>
 <form method="post" action="/block"><input type="hidden" name="csrf" value="{{csrf}}"><label>Address, @domain, or wildcard pattern (*)</label><input name="pattern" required placeholder="newsletter@example.com"><button>Add rule</button></form></section>
 <section id="smtp"><div class="section-head"><div><h2>Outbound SMTP</h2><p class="muted">Google app password or your own authenticated SMTP provider.</p></div></div><p class="muted">Use authenticated SMTP with TLS. For Gmail, enter a Google App Password instead of your normal account password, when supported. The password is encrypted locally and never displayed again.</p>
@@ -680,7 +712,8 @@ def account():
     try:
         port=int(request.form["port"])
         if not 1<=port<=65535:raise ValueError("invalid port")
-        with db() as c:c.execute("INSERT INTO accounts(address,host,port,login,password) VALUES (?,?,?,?,?)",(request.form["address"].strip().lower(),request.form["host"].strip(),port,request.form["login"].strip(),crypt.encrypt(request.form["password"].encode()).decode()))
+        webmail_url=validate_webmail_url(request.form.get("webmail_url",""))
+        with db() as c:c.execute("INSERT INTO accounts(address,host,port,login,password,webmail_url) VALUES (?,?,?,?,?,?)",(request.form["address"].strip().lower(),request.form["host"].strip(),port,request.form["login"].strip(),crypt.encrypt(request.form["password"].encode()).decode(),webmail_url))
         flash("Account added")
     except Exception as exc:flash("Unable to add account: "+str(exc))
     return redirect("/")
@@ -695,6 +728,7 @@ def edit_account():
     password=request.form.get("password","")
     try:
         port=int(request.form.get("port","0"))
+        webmail_url=validate_webmail_url(request.form.get("webmail_url",""))
         if not is_email_address(address):raise ValueError("Invalid mailbox address")
         if not host or not login or not (1<=port<=65535):
             raise ValueError("Please complete all connection fields")
@@ -702,13 +736,13 @@ def edit_account():
             current=c.execute("SELECT id FROM accounts WHERE id=?",(account_id,)).fetchone()
             if not current:abort(404)
             if password:
-                c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,password=?,
+                c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,password=?,webmail_url=?,
                              last_error=NULL,last_error_at=NULL,last_ok=NULL,last_attempt=NULL WHERE id=?""",
-                          (address,host,port,login,crypt.encrypt(password.encode()).decode(),account_id))
+                          (address,host,port,login,crypt.encrypt(password.encode()).decode(),webmail_url,account_id))
             else:
-                c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,
+                c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,webmail_url=?,
                              last_error=NULL,last_ok=NULL WHERE id=?""",
-                          (address,host,port,login,account_id))
+                          (address,host,port,login,webmail_url,account_id))
         flash("Mailbox updated. Stored password was "+("replaced." if password else "preserved."))
     except sqlite3.IntegrityError:
         flash("Another mailbox already uses this address.")
