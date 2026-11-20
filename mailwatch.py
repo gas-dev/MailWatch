@@ -439,7 +439,7 @@ def notify(kind,day):
                 end=(start+timedelta(days=1)).replace(hour=8,minute=0,second=0,microsecond=0)
                 items=c.execute("""SELECT m.*,a.address FROM messages m JOIN accounts a
                   ON a.id=m.account_id
-                  WHERE m.blocked=0 AND a.enabled=1 AND m.received>=? AND m.received<?
+                  WHERE m.blocked=0 AND a.enabled=1 AND m.received>=? AND m.received<=?
                   ORDER BY a.address,m.received DESC""",
                   (utc_str(start),utc_str(end))).fetchall()
             else:
