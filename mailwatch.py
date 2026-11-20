@@ -733,9 +733,13 @@ def edit_account():
         if not host or not login or not (1<=port<=65535):
             raise ValueError("Please complete all connection fields")
         with db() as c:
-            current=c.execute("SELECT id FROM accounts WHERE id=?",(account_id,)).fetchone()
+            current=c.execute("SELECT id,address,host,port,login,webmail_url FROM accounts WHERE id=?",(account_id,)).fetchone()
             if not current:abort(404)
-            if password:
+            if (not password and address==current["address"] and host==current["host"]
+                    and port==current["port"] and login==current["login"]):
+                # Editing only the webmail link must not reset IMAP health or scan state.
+                c.execute("UPDATE accounts SET webmail_url=? WHERE id=?",(webmail_url,account_id))
+            elif password:
                 c.execute("""UPDATE accounts SET address=?,host=?,port=?,login=?,password=?,webmail_url=?,
                              last_error=NULL,last_error_at=NULL,last_ok=NULL,last_attempt=NULL WHERE id=?""",
                           (address,host,port,login,crypt.encrypt(password.encode()).decode(),webmail_url,account_id))
