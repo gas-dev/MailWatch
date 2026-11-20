@@ -432,16 +432,30 @@ def notify(kind,day):
             previous=c.execute("SELECT status FROM jobs WHERE k=?",(ident,)).fetchone()
             if previous and previous["status"] in ("sent","sending"):
                 return "already processed"
-            items=c.execute("""SELECT m.*,a.address FROM messages m JOIN accounts a
-              ON a.id=m.account_id WHERE m.alerted=0 AND m.blocked=0 AND a.enabled=1
-              ORDER BY a.address,m.received DESC""").fetchall()
+            if kind=="daily":
+                # Full prior calendar day, plus today's messages up to 08:00
+                # Europe/Rome, regardless of whether intermediate alerts sent them.
+                start=datetime.fromisoformat(day).replace(tzinfo=TZ)
+                end=(start+timedelta(days=1)).replace(hour=8,minute=0,second=0,microsecond=0)
+                items=c.execute("""SELECT m.*,a.address FROM messages m JOIN accounts a
+                  ON a.id=m.account_id
+                  WHERE m.blocked=0 AND a.enabled=1 AND m.received>=? AND m.received<?
+                  ORDER BY a.address,m.received DESC""",
+                  (utc_str(start),utc_str(end))).fetchall()
+            else:
+                items=c.execute("""SELECT m.*,a.address FROM messages m JOIN accounts a
+                  ON a.id=m.account_id WHERE m.alerted=0 AND m.blocked=0 AND a.enabled=1
+                  ORDER BY a.address,m.received DESC""").fetchall()
         if not items and kind!="daily":
             logging.info("MailWatch: no new mail, no %s email sent",kind)
             return "no new mail"
-        title=("Daily digest: new mail pending" if kind=="daily" else "New mail alert")
+        title=("Daily digest: yesterday and today until 08:00" if kind=="daily" else "New mail alert")
         title_date=(day+" · " if kind=="daily" else "")
         mailboxes=[a["address"] for a in all_accounts() if a["enabled"]]
-        note="No new emails to report. MailWatch daily heartbeat." if kind=="daily" and not items else ""
+        note=("No emails received in the reporting window. MailWatch daily heartbeat."
+              if kind=="daily" and not items else
+              "Reporting window: "+day+" 00:00 to "+(datetime.fromisoformat(day)+timedelta(days=1)).strftime("%Y-%m-%d")+" 08:00 Europe/Rome."
+              if kind=="daily" else "")
         summary=report_text(title,items,mailboxes,note=note)
         formatted=report_html(title,items,mailboxes,note=note)
         with db() as c:
@@ -450,7 +464,9 @@ def notify(kind,day):
                       (ident,utc_str(datetime.now(timezone.utc)),"sending",
                        "%d new emails"%len(items)))
         try:
-            email_send("[MailWatch] "+title_date+str(len(items))+" new emails",summary,formatted)
+            subject=("[MailWatch] "+title_date+str(len(items))+" emails in daily recap"
+                     if kind=="daily" else "[MailWatch] "+str(len(items))+" new emails")
+            email_send(subject,summary,formatted)
         except Exception as exc:
             with db() as c:
                 c.execute("UPDATE jobs SET status='error',details=? WHERE k=?",
